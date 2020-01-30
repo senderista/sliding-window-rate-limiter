@@ -8,97 +8,103 @@ import (
 )
 
 type slidingWindow struct {
-    intervalSec int
-    subintervalSec int
-    startTime time.Time
-    lastUpdateTime time.Time
-    currentBucket int
+    intervalSec int64
+    subintervalSec int64
+    lastSyncTime time.Time
+    currentBucket int64
+    trailingBucketCount int
     buckets []int
 }
 
 // Returns a new sliding window state with total interval length `intervalSec` and subintervals of length `subintervalSec`.
 // We assume all methods on this type are protected by a mutex in the owner.
-func newState(intervalSec int, subintervalSec int) (state *slidingWindow, err error) {
+func newState(intervalSec int64, subintervalSec int64) (state *slidingWindow, err error) {
     // the window subinterval needs to evenly divide the interval, since we have an integral number of buckets
     if intervalSec % subintervalSec != 0 {
         return nil, errors.New("subinterval must evenly divide interval")
     }
-    // We need an extra bucket in order to store a full interval of data when the current time is not on the subinterval boundary.
-    // Note that we estimate the counts in the trailing bucket by weighting them by the trailing subinterval's adjusted length:
+    // We use an extra counter in order to store a full interval of data when the current time is not on the subinterval boundary.
+    // Note that we estimate the count in this "trailing bucket" by weighting it by the trailing subinterval's adjusted length:
     // e.g. for a 1-minute interval with a single subinterval, we would use 2 buckets, one to represent the current minute and
     // the other to represent the previous minute. If we are only 30s into the current minute, we estimate the total count as
     // the count in the current minute plus half the count in the previous minute. If we are 45s into the current minute, we
     // estimate the total count as the count in the current minute plus 0.25 times the count in the previous minute, etc.
     // Since this approximation assumes that all counts in the trailing subinterval are uniformly distributed over time, it can
     // lead to both undercounting and overcounting, but is more accurate overall.
-    numBuckets := (intervalSec / subintervalSec) + 1
+    numBuckets := (intervalSec / subintervalSec)
     currentTime := time.Now()
     return &slidingWindow{
         intervalSec: intervalSec,
         subintervalSec: subintervalSec,
-        startTime: currentTime,
-        lastUpdateTime: currentTime,
-        currentBucket: 0,
+        lastSyncTime: currentTime,
+        currentBucket: (currentTime.Unix() % intervalSec) / subintervalSec,
+        trailingBucketCount: 0,
         buckets: make([]int, numBuckets),
     }, nil
 }
 
 // For internal/debugging use only.
 func (state *slidingWindow) dump() string {
-    return fmt.Sprintf("Current bucket: %d\n", state.currentBucket) + fmt.Sprintf("Buckets: %d\n", state.buckets)
+    return fmt.Sprintf("Current bucket: %d\n", state.currentBucket) +
+        fmt.Sprintf("Buckets: %d\n", state.buckets) +
+        fmt.Sprintf("Trailing bucket count: %d\n", state.trailingBucketCount)
 }
 
 func (state *slidingWindow) syncWithCurrentTime(currentTime time.Time) {
-    // calculate current bucket index: number of subintervals elapsed since start time, mod number of buckets
-    timeSinceStartSec := int(currentTime.Sub(state.startTime).Seconds())
-    subintervalsSinceLastSync := timeSinceStartSec / state.subintervalSec
-    currentBucket := subintervalsSinceLastSync % len(state.buckets)
+    // index of the bucket corresponding to the current subinterval offset
+    currentBucket := (currentTime.Unix() % state.intervalSec) / state.subintervalSec
     // if last update was > intervalSec ago, then zero out all buckets, otherwise zero out buckets for any subintervals
     // that have elapsed since the last sync.
-    timeSinceLastUpdateSec := int(currentTime.Sub(state.lastUpdateTime).Seconds())
-    if timeSinceLastUpdateSec > state.intervalSec {
+    timeSinceLastSyncSec := int64(currentTime.Sub(state.lastSyncTime).Seconds())
+    // if the full interval has elapsed, we need to zero out all buckets, including the trailing bucket count.
+    if timeSinceLastSyncSec >= state.intervalSec {
         // zero out all buckets
         for i, _ := range state.buckets {
             state.buckets[i] = 0
         }
+        state.trailingBucketCount = 0
     } else {
-        // expire old buckets in order until we reach the current bucket index
         cb := state.currentBucket
+        // save the previous current bucket count in the trailing bucket count, unless we're still in the same subinterval
+        if cb != currentBucket || timeSinceLastSyncSec > state.subintervalSec {
+            state.trailingBucketCount = state.buckets[currentBucket]
+        }
+        // if we've wrapped all the way around to the previous synced bucket, but the full interval hasn't elapsed, we need to
+        // zero out all buckets, so prime the bucket-zeroing loop condition below.
+        if cb == currentBucket && timeSinceLastSyncSec > state.subintervalSec {
+            cb += 1
+        }
+        // expire old buckets in order until we reach the current bucket index
         for cb != currentBucket {
-            cb = (cb + 1) % len(state.buckets)
+            cb = (cb + 1) % int64(len(state.buckets))
             state.buckets[cb] = 0
         }
     }
     // finally sync current bucket
     state.currentBucket = currentBucket
+    // update sync time
+    state.lastSyncTime = currentTime
 }
 
 func (state *slidingWindow) GetTotalEventCount(currentTime time.Time) int {
     state.syncWithCurrentTime(currentTime)
-    // find the bucket holding oldest data from up to the full interval ago
-    // trailingBucket := nonNegMod((state.currentBucket + 1), len(state.buckets))
-    trailingBucket := (state.currentBucket + 1) % len(state.buckets)
     // the corrected total count is the sum of all subinterval counts,
     // but with the trailing subinterval weighted by its overlap with the current (sliding) interval.
     // See comments above for fuller explanation.
-    timeSinceStartSec := int(currentTime.Sub(state.startTime).Seconds())
-    subintervalRemainingSec := state.subintervalSec - (timeSinceStartSec % state.subintervalSec)
+    subintervalRemainingSec := state.subintervalSec - (currentTime.Unix() % state.subintervalSec)
     trailingBucketWeight := float32(subintervalRemainingSec) / float32(state.subintervalSec)
-    // we subtract the trailing bucket count and then add its weighted count to get corrected total count
+    // we add the weighted trailing bucket count to the counts of all buckets to get corrected total count
     totalCount := 0
-    for i, c := range state.buckets {
-        if i != trailingBucket { 
-            totalCount += c
-        }
+    for _, c := range state.buckets {
+        totalCount += c
     }
-    totalCount += int(float32(state.buckets[trailingBucket]) * trailingBucketWeight)
+    totalCount += int(float32(state.trailingBucketCount) * trailingBucketWeight)
     return totalCount
 }
 
 func (state *slidingWindow) RecordEvent(currentTime time.Time) {
     state.syncWithCurrentTime(currentTime)
     state.buckets[state.currentBucket] += 1
-    state.lastUpdateTime = currentTime
 }
 
 type Limiter struct {
@@ -108,8 +114,7 @@ type Limiter struct {
 }
 
 // Returns a new Limiter with allowed rate `requestsAllowedPerSec` and approximate sliding window of length `intervalSec` with resolution `subintervalSec`.
-func New(requestsAllowedInInterval int, intervalSec int, subintervalSec int) (limiter *Limiter, err error) {
-    // this gives the rate in time.Duration natural units (nanoseconds). to get the rate in the given time unit, we need to multiply by the given unit.
+func New(requestsAllowedInInterval int, intervalSec int64, subintervalSec int64) (limiter *Limiter, err error) {
     state, err := newState(intervalSec, subintervalSec)
     if (err != nil) {
         return nil, err
@@ -124,7 +129,7 @@ func New(requestsAllowedInInterval int, intervalSec int, subintervalSec int) (li
 func (limiter *Limiter) ShouldAllowRequest(key uint64) bool {
     // We need to lock the mutex before doing any reads to ensure we're observing a consistent state.
     // We could use sync.RWMutex to avoid taking an exclusive lock on reads, but then we'd need to spin later to upgrade the lock to exclusive.
-    // Also, even "read" methods on our state like GetTotalEventCount() update the current time, so need an exclusive lock.
+    // Also, even "read" methods on our state like GetTotalEventCount() update the current time, so we need an exclusive lock anyway.
     limiter.stateMu.Lock()
     defer limiter.stateMu.Unlock()
     currentTime := time.Now()
