@@ -1,13 +1,21 @@
 package ratelimit
 
 import (
-    "fmt"
     "errors"
+    "fmt"
+    "strconv"
     "sync"
     "time"
+    "github.com/go-redis/redis/v7"
 )
 
+// this assumes that `subintervalSec` divides `intervalSec`
+func getCurrentSubinterval(currentTime time.Time, intervalSec int64, subintervalSec int64) int64 {
+    return (currentTime.Unix() % intervalSec) / subintervalSec
+}
+
 type slidingWindow struct {
+    mu sync.Mutex
     intervalSec int64
     subintervalSec int64
     lastSyncTime time.Time
@@ -21,7 +29,8 @@ type slidingWindow struct {
 func newState(intervalSec int64, subintervalSec int64) (state *slidingWindow, err error) {
     // the window subinterval needs to evenly divide the interval, since we have an integral number of buckets
     if intervalSec % subintervalSec != 0 {
-        return nil, errors.New("subinterval must evenly divide interval")
+        err = errors.New("subinterval must evenly divide interval")
+        return
     }
     // We use an extra counter in order to store a full interval of data when the current time is not on the subinterval boundary.
     // Note that we estimate the count in this "trailing bucket" by weighting it by the trailing subinterval's adjusted length:
@@ -33,14 +42,15 @@ func newState(intervalSec int64, subintervalSec int64) (state *slidingWindow, er
     // lead to both undercounting and overcounting, but is more accurate overall.
     numBuckets := (intervalSec / subintervalSec)
     currentTime := time.Now()
-    return &slidingWindow{
+    state = &slidingWindow{
         intervalSec: intervalSec,
         subintervalSec: subintervalSec,
         lastSyncTime: currentTime,
-        currentBucket: (currentTime.Unix() % intervalSec) / subintervalSec,
+        currentBucket: getCurrentSubinterval(currentTime, intervalSec, subintervalSec),
         trailingBucketCount: 0,
         buckets: make([]int, numBuckets),
-    }, nil
+    }
+    return
 }
 
 // For internal/debugging use only.
@@ -52,25 +62,25 @@ func (state *slidingWindow) dump() string {
 
 func (state *slidingWindow) syncWithCurrentTime(currentTime time.Time) {
     // index of the bucket corresponding to the current subinterval offset
-    currentBucket := (currentTime.Unix() % state.intervalSec) / state.subintervalSec
+    currentBucket := getCurrentSubinterval(currentTime, state.intervalSec, state.subintervalSec)
     // if last update was > intervalSec ago, then zero out all buckets, otherwise zero out buckets for any subintervals
     // that have elapsed since the last sync.
     timeSinceLastSyncSec := int64(currentTime.Sub(state.lastSyncTime).Seconds())
     // if the full interval has elapsed, we need to zero out all buckets, including the trailing bucket count.
     if timeSinceLastSyncSec >= state.intervalSec {
-        // zero out all buckets
         for i, _ := range state.buckets {
             state.buckets[i] = 0
         }
         state.trailingBucketCount = 0
     } else {
         cb := state.currentBucket
+        // FIXME: all this special-case code before the loop is pretty hacky
         // save the previous current bucket count in the trailing bucket count, unless we're still in the same subinterval
         if cb != currentBucket || timeSinceLastSyncSec > state.subintervalSec {
             state.trailingBucketCount = state.buckets[currentBucket]
         }
         // if we've wrapped all the way around to the previous synced bucket, but the full interval hasn't elapsed, we need to
-        // zero out all buckets, so prime the bucket-zeroing loop condition below.
+        // zero out all buckets (but not the trailing bucket count), so prime the bucket-zeroing loop condition below.
         if cb == currentBucket && timeSinceLastSyncSec > state.subintervalSec {
             cb += 1
         }
@@ -86,7 +96,7 @@ func (state *slidingWindow) syncWithCurrentTime(currentTime time.Time) {
     state.lastSyncTime = currentTime
 }
 
-func (state *slidingWindow) GetTotalEventCount(currentTime time.Time) int {
+func (state *slidingWindow) GetTotalEventCountInCurrentInterval(currentTime time.Time) int {
     state.syncWithCurrentTime(currentTime)
     // the corrected total count is the sum of all subinterval counts,
     // but with the trailing subinterval weighted by its overlap with the current (sliding) interval.
@@ -102,50 +112,194 @@ func (state *slidingWindow) GetTotalEventCount(currentTime time.Time) int {
     return totalCount
 }
 
-func (state *slidingWindow) RecordEvent(currentTime time.Time) {
+func (state *slidingWindow) IncrementEventCount(currentTime time.Time, eventCount int) {
     state.syncWithCurrentTime(currentTime)
-    state.buckets[state.currentBucket] += 1
+    state.buckets[state.currentBucket] += eventCount
+}
+
+func (state *slidingWindow) GetEventCountForSubinterval(currentTime time.Time, subinterval int64) int {
+    state.syncWithCurrentTime(currentTime)
+    return state.buckets[subinterval]
+}
+
+func (state *slidingWindow) ReplaceEventCountForSubinterval(currentTime time.Time, subinterval int64, eventCount int) {
+    state.syncWithCurrentTime(currentTime)
+    state.buckets[subinterval] = eventCount
 }
 
 type Limiter struct {
+    clientKey uint64
     requestsAllowedInInterval int
-    stateMu sync.Mutex
     state *slidingWindow
+    syncManager *syncManager
 }
 
 // Returns a new Limiter with allowed rate `requestsAllowedPerSec` and approximate sliding window of length `intervalSec` with resolution `subintervalSec`.
-func New(requestsAllowedInInterval int, intervalSec int64, subintervalSec int64) (limiter *Limiter, err error) {
+func New(clientKey uint64, requestsAllowedInInterval int, intervalSec int64, subintervalSec int64, syncDBHostPort string) (limiter *Limiter, err error) {
     state, err := newState(intervalSec, subintervalSec)
     if (err != nil) {
-        return nil, err
+        return
     }
-    return &Limiter {
+    var syncManager *syncManager = nil
+    if syncDBHostPort != "" {
+        syncManager, err = newSyncManager(clientKey, state, syncDBHostPort)
+        if err != nil {
+            return
+        }
+    }
+    limiter = &Limiter {
+        clientKey: clientKey,
         requestsAllowedInInterval: requestsAllowedInInterval,
         state: state,
-    }, nil
+        syncManager: syncManager,
+    }
+    return
 }
 
 // Returns whether a new request should be allowed, given the allowed request count per interval. This method is thread-safe.
-func (limiter *Limiter) ShouldAllowRequest(key uint64) bool {
+func (limiter *Limiter) ShouldAllowRequest() bool {
     // We need to lock the mutex before doing any reads to ensure we're observing a consistent state.
     // We could use sync.RWMutex to avoid taking an exclusive lock on reads, but then we'd need to spin later to upgrade the lock to exclusive.
-    // Also, even "read" methods on our state like GetTotalEventCount() update the current time, so we need an exclusive lock anyway.
-    limiter.stateMu.Lock()
-    defer limiter.stateMu.Unlock()
+    // Also, even "read" methods on our state like GetTotalEventCountForInterval() update the current time, so we need an exclusive lock anyway.
+    limiter.state.mu.Lock()
+    defer limiter.state.mu.Unlock()
     currentTime := time.Now()
-    requestsInInterval := limiter.state.GetTotalEventCount(currentTime)
+    requestsInInterval := limiter.state.GetTotalEventCountInCurrentInterval(currentTime)
     if limiter.requestsAllowedInInterval - requestsInInterval >= 1 {
-        limiter.state.RecordEvent(currentTime)
+        limiter.state.IncrementEventCount(currentTime, 1)
+        if limiter.syncManager != nil {
+            limiter.syncManager.IncrementEventCount(currentTime, 1)
+        }
         return true
     }
     return false
 }
 
 // For internal testing/debugging only.
-func (limiter *Limiter) getRemainingRequestsAllowedInInterval(key uint64) int {
-    limiter.stateMu.Lock()
-    defer limiter.stateMu.Unlock()
+func (limiter *Limiter) getRemainingRequestsAllowedInInterval() int {
+    limiter.state.mu.Lock()
+    defer limiter.state.mu.Unlock()
     currentTime := time.Now()
-    requestsInInterval := limiter.state.GetTotalEventCount(currentTime)
+    requestsInInterval := limiter.state.GetTotalEventCountInCurrentInterval(currentTime)
     return limiter.requestsAllowedInInterval - requestsInInterval
+}
+
+type syncManager struct {
+    clientKey uint64
+    state *slidingWindow
+    redisClient *redis.Client
+}
+
+func newSyncManager(clientKey uint64, state *slidingWindow, dbHostPort string) (mgr *syncManager, err error) {
+    // establish the connection to redis
+    client := redis.NewClient(&redis.Options{
+        Addr: dbHostPort,
+        Password: "", // no password set
+        DB: 0,  // use default DB
+    })
+    _, err = client.Ping().Result()
+    if err != nil {
+        return
+    }
+    // instantiate new syncManager, then kick off state update goroutine before returning it
+    mgr = &syncManager{
+        clientKey: clientKey,
+        state: state,
+        redisClient: client,
+    }
+    mgr.initializeTimer()
+    return
+}
+
+func (syncManager *syncManager) initializeTimer() {
+    // et up the timer that syncs counts from the previous subinterval at the beginning of each subinterval.
+    // since we need to synchronize subintervals across clients, wait to start timer until we're on a subinterval boundary.
+    currentTime := time.Now()
+    // calculate next subinterval boundary, in higher resolution (milliseconds) than seconds so that synchronization errors across clients don't compound
+    currentTimeSec := currentTime.Unix()
+    currentTimeMillis := currentTime.UnixNano() / 1000000
+    millisUntilNextSec := 1000 - (currentTimeMillis % 1000)
+    nextTimeSec := currentTimeSec + 1
+    subintervalRemainingAfterNextSec := syncManager.state.subintervalSec - (nextTimeSec % syncManager.state.subintervalSec)
+    millisUntilNextSubinterval := millisUntilNextSec + (subintervalRemainingAfterNextSec * 1000)
+    time.Sleep(time.Duration(millisUntilNextSubinterval) * time.Millisecond)
+    // the ticker won't produce its first tick until its time interval has elapsed, but that should be OK.
+    ticker := time.NewTicker(time.Duration(syncManager.state.subintervalSec) * time.Second)
+    go func() {
+        // if we're not dropping ticks on the floor, we should be able to assume that this is the actual current time.
+        for currentTime := range ticker.C {
+            count, err := syncManager.syncSharedEventCounts(currentTime)
+            if err != nil {
+                fmt.Println(err)
+            } else {
+                fmt.Printf("Synced count from Redis: %d\n", count)
+            }
+        }
+    }()
+}
+
+// Increments the shared count in Redis for the current subinterval.
+func (syncManager *syncManager) IncrementEventCount(currentTime time.Time, increment int) (success bool, err error) {
+    success = true
+    // calculate current subinterval
+    subinterval := getCurrentSubinterval(currentTime, syncManager.state.intervalSec, syncManager.state.subintervalSec)
+    redisKey := fmt.Sprintf("%d:bucket:%d", syncManager.clientKey, subinterval)
+    // calculate absolute time of end of current subinterval
+    subintervalRemainingSec := syncManager.state.subintervalSec - (currentTime.Unix() % syncManager.state.subintervalSec)
+    subintervalEndSec := currentTime.Unix() + subintervalRemainingSec
+    // the assumption is that each client syncs the shared counts for a subinterval at the beginning of the next subinterval,
+    // so we only need to persist the counts until the end of the next subinterval.
+    expireTimeSec := subintervalEndSec + syncManager.state.subintervalSec
+    pipe := syncManager.redisClient.Pipeline()
+    pipe.IncrBy(redisKey, int64(increment))
+    pipe.ExpireAt(redisKey, time.Unix(expireTimeSec, 0))
+    _, err = pipe.Exec()
+    if err != nil {
+        success = false
+    }
+    return
+}
+
+// Increments the shared count in Redis for the current subinterval.
+func (syncManager *syncManager) GetSharedEventCountForSubinterval(subinterval int64) (count int, err error) {
+    // calculate current subinterval
+    redisKey := fmt.Sprintf("%d:bucket:%d", syncManager.clientKey, subinterval)
+    val, err := syncManager.redisClient.Get(redisKey).Result()
+    // nil error from Redis just means the key was never incremented after it expired, so we set it to 0.
+    if err != nil {
+        count = 0
+        if err == redis.Nil {
+            err = nil
+        }
+        return
+    }
+    count, err = strconv.Atoi(val)
+    return
+}
+
+// Run at the beginning of each subinterval to sync event counts for the last subinterval from other clients.
+func (syncManager *syncManager) syncSharedEventCounts(currentTime time.Time) (count int, err error) {
+    // This is executed in a goroutine that runs asynchronously with the main thread, so we need to make state access threadsafe.
+    syncManager.state.mu.Lock()
+    defer syncManager.state.mu.Unlock()
+    currentSubinterval := getCurrentSubinterval(currentTime, syncManager.state.intervalSec, syncManager.state.subintervalSec)
+    // we don't use modulo because it could give a negative result
+    var previousSubinterval int64
+    if currentSubinterval == 0 {
+        previousSubinterval = int64(len(syncManager.state.buckets) - 1)
+    } else {
+        previousSubinterval = int64(currentSubinterval - 1)
+    }
+    count, err = syncManager.GetSharedEventCountForSubinterval(previousSubinterval)
+    if err != nil {
+        return
+    }
+    previousSubintervalCount := syncManager.state.GetEventCountForSubinterval(currentTime, previousSubinterval)
+    // all events in the previous subinterval (including our own) should have been returned by GetSharedEventCountForSubinterval(),
+    // but for robustness we handle cases where that didn't happen for some reason.
+    if count > previousSubintervalCount {
+        // note that shared event count should include our local event count, so we replace rather than increment the local count
+        syncManager.state.ReplaceEventCountForSubinterval(currentTime, previousSubinterval, count)
+    }
+    return
 }

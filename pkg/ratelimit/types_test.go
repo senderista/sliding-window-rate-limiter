@@ -1,16 +1,17 @@
 package ratelimit
 
 import (
+    "os"
     "testing"
     "time"
 )
 
 func tryRequest(t *testing.T, limiter *Limiter, startTime time.Time) {
     secondsElapsed := time.Now().Sub(startTime).Seconds()
-    remainingRequestsAllowed := limiter.getRemainingRequestsAllowedInInterval(0)
+    remainingRequestsAllowed := limiter.getRemainingRequestsAllowedInInterval()
     t.Logf("Bucket state after %.0f seconds: %s", secondsElapsed, limiter.state.dump())
     t.Logf("remaining requests allowed after %.0f seconds: %d", secondsElapsed, remainingRequestsAllowed)
-    if !limiter.ShouldAllowRequest(0) {
+    if !limiter.ShouldAllowRequest() {
          t.Errorf("rate limiter throttled us after %.0f seconds", secondsElapsed)
     } else {
         t.Logf("rate limiter allowed request after %.0f seconds", secondsElapsed)
@@ -19,8 +20,13 @@ func tryRequest(t *testing.T, limiter *Limiter, startTime time.Time) {
 
 func TestOneClient(t *testing.T) {
     // initialize limiter to allow 100 requests/minute, with sliding window of 1 minute and and subintervals of 10 seconds.
-    // limiter, _ := New(100, 60, 10)
-    limiter, _ := New(100, 20, 5)
+    // (clientKey, requestsAllowedInInterval int, intervalSec int64, subintervalSec int64, syncDBHostPort string)
+    limiter, err := New(0, 100, 20, 5, "localhost:6379")
+    // limiter, err := New(0, 100, 20, 5, "")
+    if err != nil {
+        t.Error(err)
+        os.Exit(1)
+    }
     startTime := time.Now()
     // for i := 0; i < 100; i++ {
     for i := 0; i < 100; i++ {
@@ -52,24 +58,3 @@ func TestOneClient(t *testing.T) {
     time.Sleep(time.Second * 21)
     tryRequest(t, limiter, startTime)
 }
-
-// var tests = []struct {
-//     a, b int
-//     want int
-// }{
-//     {0, 1, 0},
-//     {1, 0, 0},
-//     {2, -2, -2},
-//     {0, -1, -1},
-//     {-1, 0, -1},
-// }
-
-// for _, tt := range tests {
-//     testname := fmt.Sprintf("%d,%d", tt.a, tt.b)
-//     t.Run(testname, func(t *testing.T) {
-//         ans := IntMin(tt.a, tt.b)
-//         if ans != tt.want {
-//             t.Errorf("got %d, want %d", ans, tt.want)
-//         }
-//     })
-// }
