@@ -1,3 +1,5 @@
+// Package ratelimit provides a sliding window approximation for counting requests and deciding if new requests should be allowed.
+// It uses a Redis shared instance to synchronize request counts and throttling decisions among distributed clients.
 package ratelimit
 
 import (
@@ -136,9 +138,10 @@ type Limiter struct {
 	syncManager               *syncManager
 }
 
-// Returns a new Limiter with allowed rate `requestsAllowedPerSec` and approximate sliding window of length `intervalSec` with resolution `subintervalSec`.
-// `limiterKey` is intended to be a unique identifier for the returned limiter object (for storing in a map and possibly for logging), while `resourceKey` is intended to be
-// a 64-bit hash value of some uniquely identifying resource info (such as a URL path).
+// Returns a new `Limiter` with allowed rate `requestsAllowedPerSec` and approximate sliding window of length `intervalSec` with resolution `subintervalSec`.
+// `limiterKey` is intended to be a unique identifier for the returned `Limiter` (possibly for logging), while `resourceKey` is intended to be
+// a 64-bit hash value of some uniquely identifying resource info (such as a URL path), which can be used as a key in a map to find the appropriate `Limiter`
+// instance for a request for the resource. `syncDBHostPort` is the address of the shared Redis instance (can be empty for a local `Limiter`).
 func New(limiterKey uint64, resourceKey uint64, requestsAllowedInInterval int, intervalSec int64, subintervalSec int64, syncDBHostPort string) (limiter *Limiter, err error) {
 	state, err := newState(intervalSec, subintervalSec)
 	if err != nil {
