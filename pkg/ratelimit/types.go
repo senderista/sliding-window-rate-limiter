@@ -3,6 +3,7 @@ package ratelimit
 import (
     "errors"
     "fmt"
+    "log"
     "strconv"
     "sync"
     "time"
@@ -128,27 +129,31 @@ func (state *slidingWindow) ReplaceEventCountForSubinterval(currentTime time.Tim
 }
 
 type Limiter struct {
-    clientKey uint64
+    limiterKey uint64
+    resourceKey uint64
     requestsAllowedInInterval int
     state *slidingWindow
     syncManager *syncManager
 }
 
 // Returns a new Limiter with allowed rate `requestsAllowedPerSec` and approximate sliding window of length `intervalSec` with resolution `subintervalSec`.
-func New(clientKey uint64, requestsAllowedInInterval int, intervalSec int64, subintervalSec int64, syncDBHostPort string) (limiter *Limiter, err error) {
+// `limiterKey` is intended to be a unique identifier for the returned limiter object (for storing in a map and possibly for logging), while `resourceKey` is intended to be
+// a 64-bit hash value of some uniquely identifying resource info (such as a URL path).
+func New(limiterKey uint64, resourceKey uint64, requestsAllowedInInterval int, intervalSec int64, subintervalSec int64, syncDBHostPort string) (limiter *Limiter, err error) {
     state, err := newState(intervalSec, subintervalSec)
     if (err != nil) {
         return
     }
     var syncManager *syncManager = nil
     if syncDBHostPort != "" {
-        syncManager, err = newSyncManager(clientKey, state, syncDBHostPort)
+        syncManager, err = newSyncManager(limiterKey, resourceKey, state, syncDBHostPort)
         if err != nil {
             return
         }
     }
     limiter = &Limiter {
-        clientKey: clientKey,
+        limiterKey: limiterKey,
+        resourceKey: resourceKey,
         requestsAllowedInInterval: requestsAllowedInInterval,
         state: state,
         syncManager: syncManager,
@@ -185,12 +190,13 @@ func (limiter *Limiter) getRemainingRequestsAllowedInInterval() int {
 }
 
 type syncManager struct {
-    clientKey uint64
+    limiterKey uint64
+    resourceKey uint64
     state *slidingWindow
     redisClient *redis.Client
 }
 
-func newSyncManager(clientKey uint64, state *slidingWindow, dbHostPort string) (mgr *syncManager, err error) {
+func newSyncManager(limiterKey uint64, resourceKey uint64, state *slidingWindow, dbHostPort string) (mgr *syncManager, err error) {
     // establish the connection to redis
     client := redis.NewClient(&redis.Options{
         Addr: dbHostPort,
@@ -203,7 +209,8 @@ func newSyncManager(clientKey uint64, state *slidingWindow, dbHostPort string) (
     }
     // instantiate new syncManager, then kick off state update goroutine before returning it
     mgr = &syncManager{
-        clientKey: clientKey,
+        limiterKey: limiterKey,
+        resourceKey: resourceKey,
         state: state,
         redisClient: client,
     }
@@ -212,7 +219,7 @@ func newSyncManager(clientKey uint64, state *slidingWindow, dbHostPort string) (
 }
 
 func (syncManager *syncManager) initializeTimer() {
-    // et up the timer that syncs counts from the previous subinterval at the beginning of each subinterval.
+    // set up the timer that syncs counts from the previous subinterval at the beginning of each subinterval.
     // since we need to synchronize subintervals across clients, wait to start timer until we're on a subinterval boundary.
     currentTime := time.Now()
     // calculate next subinterval boundary, in higher resolution (milliseconds) than seconds so that synchronization errors across clients don't compound
@@ -222,17 +229,17 @@ func (syncManager *syncManager) initializeTimer() {
     nextTimeSec := currentTimeSec + 1
     subintervalRemainingAfterNextSec := syncManager.state.subintervalSec - (nextTimeSec % syncManager.state.subintervalSec)
     millisUntilNextSubinterval := millisUntilNextSec + (subintervalRemainingAfterNextSec * 1000)
-    time.Sleep(time.Duration(millisUntilNextSubinterval) * time.Millisecond)
     // the ticker won't produce its first tick until its time interval has elapsed, but that should be OK.
     ticker := time.NewTicker(time.Duration(syncManager.state.subintervalSec) * time.Second)
     go func() {
+        // sleep until we're on subinterval boundary
+        time.Sleep(time.Duration(millisUntilNextSubinterval) * time.Millisecond)
         // if we're not dropping ticks on the floor, we should be able to assume that this is the actual current time.
         for currentTime := range ticker.C {
-            count, err := syncManager.syncSharedEventCounts(currentTime)
-            if err != nil {
-                fmt.Println(err)
-            } else {
-                fmt.Printf("Synced count from Redis: %d\n", count)
+            // sync is best-effort, so log errors but don't propagate them
+            _, err := syncManager.syncSharedEventCounts(currentTime)
+            if err !=  nil {
+                log.Printf("Sync error: %v\n", err)
             }
         }
     }()
@@ -243,7 +250,7 @@ func (syncManager *syncManager) IncrementEventCount(currentTime time.Time, incre
     success = true
     // calculate current subinterval
     subinterval := getCurrentSubinterval(currentTime, syncManager.state.intervalSec, syncManager.state.subintervalSec)
-    redisKey := fmt.Sprintf("%d:bucket:%d", syncManager.clientKey, subinterval)
+    redisKey := fmt.Sprintf("%d:bucket:%d", syncManager.resourceKey, subinterval)
     // calculate absolute time of end of current subinterval
     subintervalRemainingSec := syncManager.state.subintervalSec - (currentTime.Unix() % syncManager.state.subintervalSec)
     subintervalEndSec := currentTime.Unix() + subintervalRemainingSec
@@ -263,7 +270,7 @@ func (syncManager *syncManager) IncrementEventCount(currentTime time.Time, incre
 // Increments the shared count in Redis for the current subinterval.
 func (syncManager *syncManager) GetSharedEventCountForSubinterval(subinterval int64) (count int, err error) {
     // calculate current subinterval
-    redisKey := fmt.Sprintf("%d:bucket:%d", syncManager.clientKey, subinterval)
+    redisKey := fmt.Sprintf("%d:bucket:%d", syncManager.resourceKey, subinterval)
     val, err := syncManager.redisClient.Get(redisKey).Result()
     // nil error from Redis just means the key was never incremented after it expired, so we set it to 0.
     if err != nil {
