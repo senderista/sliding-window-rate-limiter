@@ -27,7 +27,9 @@ if allowed {
 
 ## Testing
 
-Run `go test` from `sliding-window-rate-limiter/pkg/ratelimit`.
+After starting `redis-server` at `localhost:6379`, run `go test` from `sliding-window-rate-limiter/pkg/ratelimit/`.
+
+A trivial HTTP server that rate-limits requests by URL path can be run with `go run main.go` from `sliding-window-rate-limiter/cmd/server/`. Manual testing against this server can be done with a command-line HTTP client like `curl`.
 
 ## Design Decisions
 
